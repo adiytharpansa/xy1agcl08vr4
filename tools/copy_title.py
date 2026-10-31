@@ -1,4 +1,9 @@
 # Robot penyalin judul untuk GitHub Actions (berjalan di runner, token repo sendiri).
+# v5.4 (31 Okt 2026): push_episode DIPECAH per potongan (maks ~250 MB per push,
+# playlist.m3u8 SELALU di potongan terakhir) — satu push tunggal film utuh
+# (166-172 potongan, >2 GB) ditolak GitHub HTTP 500/RPC failed 5/5 (terbukti
+# Scarlet & Neon Genesis Evangelion: The End of Evangelion). Push terpotong
+# aman dilanjutkan: entri episode yang sudah ada di repo dibaca dulu (resume).
 # v5.3 (31 Okt 2026): rotasi kandidat menembus kegagalan segmen (percobaan
 # ulang episode memakai kandidat terverifikasi berikutnya), probing kandidat
 # paralel (maks 6), putaran ambil segmen 3 -> 4. Selebihnya identik v5.2:
@@ -295,19 +300,46 @@ def push_commit(new_root_tree, msg):
     log('push gagal total'); sys.exit(4)
 
 def push_episode(ep):
-    """Satu episode = satu pohon episode + splice ke akar + commit-tree + push."""
+    """Satu episode = commit-tree + push, DIPECAH per potongan bila besar:
+    maks ~250 MB per push dan playlist.m3u8 selalu di potongan terakhir,
+    supaya episode film raksasa tidak ditolak GitHub (HTTP 500 push tunggal)
+    dan episode setengah jalan tidak pernah memajang playlist yatim."""
     edir = os.path.join(OUT, f'ep{ep}')
-    ep_entries = []
-    for fn in sorted(os.listdir(edir)):
-        r = git('hash-object', '-w', os.path.join(edir, fn), timeout=900)
-        if r.returncode != 0:
-            log('hash-object gagal', fn); sys.exit(4)
-        ep_entries.append({'mode': '100644', 'type': 'blob', 'sha': r.stdout.strip(), 'name': fn})
-    ep_tree = mktree(ep_entries)
-    root = splice(HEAD_NOW['sha'], [WID, f'ep{ep}'],
-                  {'mode': '040000', 'type': 'tree', 'sha': ep_tree})
-    commit = push_commit(root, f'{WID} episode {ep} (segmen HLS)')
-    log(f'  ep{ep} ter-push ({commit[:7]})')
+    files = [(fn, os.path.getsize(os.path.join(edir, fn))) for fn in sorted(os.listdir(edir))]
+    seg_files = [(fn, sz) for fn, sz in files if fn != 'playlist.m3u8']
+    pl_files = [fn for fn, sz in files if fn == 'playlist.m3u8']
+    # Entri episode yang SUDAH ada di repo (resume sesudah push terpotong).
+    acc = {}
+    r = git('ls-tree', '-z', f"{HEAD_NOW['sha']}:{WID}/ep{ep}", check=False)
+    if r.returncode == 0:
+        for rec in r.stdout.split('\0'):
+            if not rec: continue
+            meta, name = rec.split('\t', 1)
+            mode, typ, sha = meta.split(' ')
+            acc[name] = {'mode': mode, 'type': typ, 'sha': sha, 'name': name}
+    BATCH_MAX = 250 * 1024 * 1024
+    batches, cur, cur_sz = [], [], 0
+    for fn, sz in seg_files:
+        if fn in acc: continue
+        if cur and cur_sz + sz > BATCH_MAX:
+            batches.append(cur); cur, cur_sz = [], 0
+        cur.append(fn); cur_sz += sz
+    if cur or not batches: batches.append(cur)
+    commit = HEAD_NOW['sha']
+    for bi, batch in enumerate(batches):
+        last = bi == len(batches) - 1
+        todo = list(batch) + (pl_files if last else [])
+        if not todo and acc: continue
+        for fn in todo:
+            r = git('hash-object', '-w', os.path.join(edir, fn), timeout=900)
+            if r.returncode != 0:
+                log('hash-object gagal', fn); sys.exit(4)
+            acc[fn] = {'mode': '100644', 'type': 'blob', 'sha': r.stdout.strip(), 'name': fn}
+        ep_tree = mktree(list(acc.values()))
+        root = splice(HEAD_NOW['sha'], [WID, f'ep{ep}'],
+                      {'mode': '040000', 'type': 'tree', 'sha': ep_tree})
+        commit = push_commit(root, f'{WID} episode {ep} (segmen HLS)')
+        log(f'  ep{ep} ter-push potongan {bi + 1}/{len(batches)} ({commit[:7]})')
     shutil.rmtree(edir, ignore_errors=True)  # hemat disk runner
     return commit
 
